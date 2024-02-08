@@ -1,0 +1,319 @@
+#include "Arduino.h"
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <ArduinoJson.h>
+
+enum ActionID {
+  ACTION_INIT = -1,
+  ACTION_READY = 0,
+  ACTION_FAILURE = 2,
+  ACTION_HOLE_CHANGED_UP = 3,
+  ACTION_HOLE_CHANGED_DOWN = 4,
+  ACTION_STROKE_CHANGED_DOWN = 5,
+  ACTION_SYNC_WITH_PUTTER = 6,
+  ACTION_SYNC_WITH_PHONE = 7,
+  ACTION_REFRESH_HOLE = 8,
+  ACTION_AT_COMMAND = 9
+};
+
+class CommandAction {
+public:
+  ActionID actionID;
+  String data;
+
+  CommandAction() : actionID(ACTION_INIT), data("initializing") {}
+
+  String toJSONString() {
+    StaticJsonDocument<1024> doc;
+    doc["actionID"] = static_cast<int>(actionID);  // Cast enum to int
+    doc["data"] = data;
+    String output;
+    serializeJson(doc, output);
+    return output;
+  }
+};
+
+// Global variables
+String blehm10Str = "";
+int LED_PIN = 51;
+int OTHER_LED_PIN = 53;
+int BUTTON_PIN = 45;
+int OTHER_BUTTON_PIN = 43;
+int BLUETOOTH_STATUS_LIGHT_PIN = 41;
+
+
+// BUTTON STUFF
+byte lastButtonState = HIGH; // Change depending on button wiring
+byte lastOtherButtonState = HIGH; // For the other button
+unsigned long debounceDuration = 50; // millis
+unsigned long lastTimeButtonStateChanged = 0;
+unsigned long lastTimeOtherButtonStateChanged = 0;
+bool buttonMessageSent = false;
+bool otherButtonMessageSent = false;
+
+/* BLUETOOTH INDICATOR */
+const int statePin = 7;
+
+/* SCREEN STUFF */
+#define SCREEN_WIDTH 128 // OLED display width
+#define SCREEN_HEIGHT 64 // OLED display height
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire);
+
+// GAME RELATED VARIABLES
+int GAME_CURRENT_HOLE = 1; // Starting number
+int GAME_LOWEST_HOLE = 1;
+int GAME_HIGHEST_HOLE = 18;
+
+
+
+// Object initialization
+HardwareSerial& blehm10(Serial1);
+
+void setup() {
+    // Initialize Serial
+    Serial.begin(9600);
+    while (!Serial); // Wait for serial port to connect
+
+    pinMode(LED_PIN, OUTPUT);
+    pinMode(OTHER_LED_PIN, OUTPUT);
+
+    pinMode(BUTTON_PIN, INPUT_PULLUP);
+    pinMode(OTHER_BUTTON_PIN, INPUT_PULLUP);
+
+    //Serial.println("start");
+    
+    // Initialize HM-10 BLE module
+    blehm10.begin(9600);
+    //blehm10.println("BLE On....");
+
+  Wire.begin();
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    //Serial.println(F("SSD1306 allocation failed"));
+    for(;;);
+  }
+
+  pinMode(statePin, INPUT);
+  pinMode(BLUETOOTH_STATUS_LIGHT_PIN, OUTPUT);
+  
+
+}
+
+void loop() {
+
+    int bluetoothConnectionState = digitalRead(statePin);
+    if(bluetoothConnectionState == HIGH)
+    {
+      digitalWrite(BLUETOOTH_STATUS_LIGHT_PIN, HIGH);
+    }
+    else
+    {
+      digitalWrite(BLUETOOTH_STATUS_LIGHT_PIN, LOW);
+    }
+
+    // BLE module input handling
+    if (blehm10.available()) {
+       String blehm10Str = blehm10.readStringUntil('\n');
+        blehm10Str.trim(); // This removes any whitespace or newline characters at the start or end of the string
+        Serial.print("Incoming Command: ");
+        Serial.println(blehm10Str);
+        //Serial.print("String Length: ");
+        //Serial.println(blehm10Str.length()); // Debugging: Print the length of the string
+
+        if(blehm10Str == "ERROR") {
+            Serial.println("ERROR WAS RECEIVED, IGNORING.");
+        }
+        else
+        {
+        CommandAction action = parseActionReceived(blehm10Str);
+        if(action.actionID == ACTION_FAILURE)
+        {
+          Serial.println("invalid command.");
+        }
+        else
+        {
+          // big switch statement?
+          switch(action.actionID) {
+
+            case ACTION_READY:
+              Serial.println("Action Ready: " + action.data);
+              break;
+
+            case ACTION_HOLE_CHANGED_UP:
+              if(canIncrementHole())
+              {
+                 GAME_CURRENT_HOLE = GAME_CURRENT_HOLE + 1;
+                sendMessage(ACTION_HOLE_CHANGED_UP, String(GAME_CURRENT_HOLE));
+                Serial.println("Hole Changed (+): " + action.data);
+              }
+              break;
+
+            case ACTION_HOLE_CHANGED_DOWN:
+              if(canDecrementHole())
+              {
+              GAME_CURRENT_HOLE = GAME_CURRENT_HOLE - 1;
+              sendMessage(ACTION_HOLE_CHANGED_DOWN, String(GAME_CURRENT_HOLE));
+              Serial.println("Hole Changed (-): " + action.data);
+              }
+              break;
+
+            case ACTION_AT_COMMAND:
+                //blehm10.print(action.data + "\r\n");
+                sendMessage(ACTION_AT_COMMAND, "Ran Command: " + action.data);
+              
+              break;
+            default:
+              //Serial.println(action.data);
+              break;
+          }
+        }
+        }
+        //Serial.print("BT Raw Data: ");
+        //Serial.println(blehm10Str);
+    }
+
+    
+    HoleChangedLoop();
+
+     screenLoop();
+}
+
+void screenLoop()
+{
+  display.clearDisplay();
+
+  display.setTextSize(2); // Small text size for "ROUND"
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(getCenteredCursorX(2, 5), 0); // Center "ROUND"
+  display.println(F("ROUND"));
+
+  display.setTextSize(5); // Larger text size for the number
+   display.setCursor(getCenteredCursorX(5, countDigits(GAME_CURRENT_HOLE)), 24); // Center the number
+  display.println(GAME_CURRENT_HOLE);
+
+  display.display();
+}
+int getCenteredCursorX(int textSize, int charCount) {
+  int charWidth = 6 * textSize;  // Approximate width of a character at the given text size
+  int totalTextWidth = charWidth * charCount;
+  return (SCREEN_WIDTH - totalTextWidth) / 2;
+}
+
+int countDigits(int number) {
+  return String(number).length();
+}
+
+
+void sendMessage(const ActionID& actionID, const String& message) {
+    const int chunkSize = 30;
+    
+
+    CommandAction cmd;
+    cmd.actionID = actionID;
+    cmd.data = message;
+
+    String json = cmd.toJSONString();
+
+    //blehm10.println(json);
+
+    // int messageLength = json.length();
+
+    // for (int i = 0; i < json.length(); i += chunkSize) {
+    //     String chunk = message.substring(i, min(i + chunkSize, messageLength));
+    //     blehm10.println(chunk);
+    //     delay(50);
+    // }
+    blehm10.println(json);
+    delay(50);
+    blehm10.println("@@@");
+}
+
+// BUTTON FUNCTIONS
+
+void HoleChangedLoop()
+{
+  // HOLE DOWN
+  if(GAME_CURRENT_HOLE > GAME_LOWEST_HOLE)
+    if (millis() - lastTimeButtonStateChanged > debounceDuration) {
+        byte buttonState = digitalRead(BUTTON_PIN);
+
+        if (buttonState != lastButtonState) {
+            lastTimeButtonStateChanged = millis();
+            lastButtonState = buttonState;
+
+            if (buttonState == LOW && !buttonMessageSent) {
+
+              --GAME_CURRENT_HOLE;
+                digitalWrite(LED_PIN, LOW);
+                buttonMessageSent = true;
+                sendMessage(ACTION_HOLE_CHANGED_DOWN, String(GAME_CURRENT_HOLE));
+            } else if (buttonState == HIGH) {
+                digitalWrite(LED_PIN, HIGH);
+                buttonMessageSent = false;
+            }
+        }
+    }
+
+    // HOLE UP
+    if(GAME_CURRENT_HOLE < GAME_HIGHEST_HOLE)
+    if (millis() - lastTimeOtherButtonStateChanged > debounceDuration) {
+        byte otherButtonState = digitalRead(OTHER_BUTTON_PIN);
+
+        if (otherButtonState != lastOtherButtonState) {
+            lastTimeOtherButtonStateChanged = millis();
+            lastOtherButtonState = otherButtonState;
+
+            if (otherButtonState == LOW && !otherButtonMessageSent) {
+                ++GAME_CURRENT_HOLE;
+                digitalWrite(OTHER_LED_PIN, LOW);
+                sendMessage(ACTION_HOLE_CHANGED_UP, String(GAME_CURRENT_HOLE));
+                otherButtonMessageSent = true;
+            } else if (otherButtonState == HIGH) {
+                digitalWrite(OTHER_LED_PIN, HIGH);
+                otherButtonMessageSent = false;
+            }
+        }
+    }
+}
+
+bool canDecrementHole()
+{
+  if(GAME_CURRENT_HOLE > GAME_LOWEST_HOLE)
+  {
+    return true;
+  }
+  return false;
+}
+bool canIncrementHole()
+{
+  if(GAME_CURRENT_HOLE < GAME_HIGHEST_HOLE)
+  {
+    return true;
+  }
+  return false;
+}
+
+CommandAction parseActionReceived(String jsonString) {
+    DynamicJsonDocument doc(1024); // Adjust size as needed
+    DeserializationError error = deserializeJson(doc, jsonString);
+
+    CommandAction cmd;
+
+    if (error) {
+        Serial.print(F("deserializeJson() failed: "));
+        //Serial.println(error.c_str());
+        cmd.actionID = ACTION_FAILURE; // Indicate an error with a special actionID
+        return cmd;
+    }
+
+    if (!doc.containsKey("A") || !doc.containsKey("D")) {
+        Serial.println(F("JSON does not contain expected keys"));
+        cmd.actionID = ACTION_FAILURE; // Indicate an error with a special actionID
+        return cmd;
+    }
+
+    cmd.actionID = doc["A"]; // Assuming actionID is an int
+    cmd.data = doc["D"].as<String>(); // Assuming data is a string
+
+    return cmd;
+}
